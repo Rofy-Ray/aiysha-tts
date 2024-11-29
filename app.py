@@ -12,6 +12,8 @@ logger = logging.getLogger(__name__)
 
 GCS_BUCKET_NAME = os.getenv('GCS_BUCKET_NAME')
 
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 try:
     spec_generator = FastPitchModel.from_pretrained("nvidia/tts_en_fastpitch")
     vocoder = HifiGanModel.from_pretrained("nvidia/tts_hifigan")
@@ -40,7 +42,7 @@ def generate_tts(text):
         
         audio = vocoder.convert_spectrogram_to_audio(spec=spectrogram)
         
-        audio_numpy = audio.to('cpu').detach().numpy()[0]
+        audio_numpy = audio.to(DEVICE).detach().numpy()[0]
         
         output_filename = f"{uuid.uuid4()}.wav"
         
@@ -52,14 +54,13 @@ def generate_tts(text):
         logger.error(f"TTS generation error: {e}")
         raise
 
-def save_audio_to_gcs(audio_file_path, text):
+def save_audio_to_gcs(audio_file_path) -> str:
     """
     Save audio file to Google Cloud Storage.
     
     Args:
         audio_file_path (str): Path to audio file
-        text (str): Original text (for context)
-    
+            
     Returns:
         str: Public URL of uploaded file
     """
@@ -96,11 +97,10 @@ def tts_handler():
         
         audio_file = generate_tts(text)
         
-        audio_url = save_audio_to_gcs(audio_file, text)
+        audio_url = save_audio_to_gcs(audio_file)
         
         return jsonify({
-            'audio_url': audio_url,
-            'text': text
+            'audio_url': audio_url
         })
     
     except ValueError as ve:
