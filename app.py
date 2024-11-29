@@ -1,89 +1,114 @@
 import os
-import subprocess
-import tempfile
 import logging
 import uuid
-import argparse
-from google.cloud import storage
+import torch
+import soundfile as sf
 from flask import Flask, request, jsonify
+from google.cloud import storage
+from nemo.collections.tts.models import FastPitchModel, HifiGanModel
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-RIVA_SERVER = os.getenv('RIVA_SERVER')
-RIVA_FUNCTION_ID = os.getenv('RIVA_FUNCTION_ID')
-RIVA_API_KEY = os.getenv('RIVA_API_KEY')
 GCS_BUCKET_NAME = os.getenv('GCS_BUCKET_NAME')
+
+try:
+    spec_generator = FastPitchModel.from_pretrained("nvidia/tts_en_fastpitch")
+    vocoder = HifiGanModel.from_pretrained("nvidia/tts_hifigan")
+except Exception as e:
+    logger.error(f"Error loading TTS models: {e}")
+    raise
 
 app = Flask(__name__)
 
-def run_riva_tts(text, output_file):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--server", default=RIVA_SERVER)
-    parser.add_argument("--use-ssl", action="store_true")
-    parser.add_argument("--metadata", nargs=2, action="append")
-    parser.add_argument("--text")
-    parser.add_argument("--voice", default='English-US.Female-1')
-    parser.add_argument("--output")
-
-    args_list = [
-        "--server", RIVA_SERVER,
-        "--use-ssl",
-        "--metadata", "function-id", RIVA_FUNCTION_ID,
-        "--metadata", "authorization", f"Bearer {RIVA_API_KEY}",
-        "--text", text,
-        "--voice", 'English-US.Female-1',
-        "--output", output_file
-    ]
-
-    args, unknown_args = parser.parse_known_args(args_list)
-
-    command = ["python", "talk.py"] + args_list
-
+def generate_tts(text):
+    """
+    Generate audio from text using NeMo FastPitch and HifiGan models.
+    
+    Args:
+        text (str): Input text to convert to speech
+    
+    Returns:
+        str: Path to generated WAV file
+    """
     try:
-        result = subprocess.run(command, check=True, capture_output=True, text=True)
-        logging.debug(f"Command output: {result.stdout}")
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Command failed with exit code {e.returncode}")
-        logging.error(f"Error output: {e.stderr}")
-        logging.error(f"Error output: {e.output}")
+        if not text or not text.strip():
+            raise ValueError("Empty text provided")
+
+        parsed = spec_generator.parse(text)
+        spectrogram = spec_generator.generate_spectrogram(tokens=parsed)
+        
+        audio = vocoder.convert_spectrogram_to_audio(spec=spectrogram)
+        
+        audio_numpy = audio.to('cpu').detach().numpy()[0]
+        
+        output_filename = f"{uuid.uuid4()}.wav"
+        
+        sf.write(output_filename, audio_numpy, 22050)
+        
+        return output_filename
+
+    except Exception as e:
+        logger.error(f"TTS generation error: {e}")
         raise
 
 def save_audio_to_gcs(audio_file_path, text):
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(GCS_BUCKET_NAME)
+    """
+    Save audio file to Google Cloud Storage.
     
-    filename = f"{uuid.uuid4()}.wav"
-    blob = bucket.blob(filename)
-    blob.upload_from_filename(audio_file_path)
+    Args:
+        audio_file_path (str): Path to audio file
+        text (str): Original text (for context)
     
-    return blob.public_url
+    Returns:
+        str: Public URL of uploaded file
+    """
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(GCS_BUCKET_NAME)
+        
+        blob = bucket.blob(os.path.basename(audio_file_path))
+        blob.upload_from_filename(audio_file_path)
+        
+        os.unlink(audio_file_path)
+        
+        return blob.public_url
+    
+    except Exception as e:
+        logger.error(f"GCS upload error: {e}")
+        raise
 
 @app.route('/tts', methods=['POST'])
 def tts_handler():
-    request_json = request.get_json(silent=True)
+    """
+    Flask endpoint for text-to-speech conversion.
     
-    if not request_json or 'text' not in request_json:
-        return jsonify({'error': 'No text provided'}), 400
-    
-    text = request_json['text']
-    
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
-        output_file = temp_file.name
-    
+    Expects JSON with 'text' key.
+    Returns audio URL or error.
+    """
     try:
-        run_riva_tts(text, output_file)
-        audio_url = save_audio_to_gcs(output_file, text)
+        request_json = request.get_json(silent=True)
+        
+        if not request_json or 'text' not in request_json:
+            return jsonify({'error': 'No text provided'}), 400
+        
+        text = request_json['text']
+        
+        audio_file = generate_tts(text)
+        
+        audio_url = save_audio_to_gcs(audio_file, text)
         
         return jsonify({
             'audio_url': audio_url,
             'text': text
         })
+    
+    except ValueError as ve:
+        return jsonify({'error': str(ve)}), 400
+    
     except Exception as e:
-        logging.error(f"An error occurred: {str(e)}")
-        return jsonify({'error': str(e)}), 500
-    finally:
-        if os.path.exists(output_file):
-            os.unlink(output_file)
+        logger.error(f"Request processing error: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
 
-# if __name__ == "__main__":
-#     app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+# if __name__ == '__main__':
+#     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
